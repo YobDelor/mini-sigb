@@ -1,0 +1,203 @@
+"""Tests de circulation : la matrice de règles, les refus de prêt, les retards,
+les sanctions et les prolongations (règles verrouillées n°2 à n°5)."""
+
+from datetime import timedelta
+
+import pytest
+
+from tests.helpers import creer_exemplaires, creer_oeuvre, creer_usager
+
+from sigb.erreurs import ErreurMetier
+from sigb.models import amendes, db, exemplaires, prets, regles
+from sigb.services import circulation
+
+
+def _pret_en_retard(reference: str, carte: str, jours: int = 5) -> int:
+    """Simule un prêt en retard en écrivant directement l'échéance passée
+    (le seul paramètre que le temps ne permet pas de tester autrement)."""
+    conn = db.get_conn()
+    try:
+        with db.transaction() as txn:
+            ex = exemplaires.par_reference(txn, reference)
+            usager = txn.execute(
+                "SELECT id FROM usager WHERE numero_carte = ?", (carte,)
+            ).fetchone()
+            pret_id = prets.creer(
+                txn, ex["id"], usager["id"], db.aujourd_hui() - timedelta(days=jours), "test"
+            )
+            exemplaires.changer_statut(txn, ex["id"], db.STATUT_EMPRUNTE)
+        return pret_id
+    finally:
+        conn.close()
+
+
+def test_echeance_calculee_par_la_matrice():
+    """Règle n°3 : la durée vient TOUJOURS de la matrice (adulte : livre 21 j)."""
+    oeuvre_id, refs = creer_oeuvre("Roman matrice", nb_copies=1)
+    carte = creer_usager("adulte")
+    result = circulation.emprunter(carte, refs[0])
+    assert result["date_retour_prevue"] == db.aujourd_hui() + timedelta(days=21)
+
+
+def test_duree_dvd_sept_jours_pour_adulte():
+    oeuvre_id, refs = creer_oeuvre("Film test", type_document="dvd", nb_copies=1)
+    carte = creer_usager("adulte")
+    result = circulation.emprunter(carte, refs[0])
+    assert result["date_retour_prevue"] == db.aujourd_hui() + timedelta(days=7)
+
+
+def test_refus_type_interdit_par_la_matrice():
+    """Règle n°3 : DVD refusés aux jeunes (matrice, pas de constante)."""
+    oeuvre_id, refs = creer_oeuvre("DVD jeune", type_document="dvd", nb_copies=1)
+    carte = creer_usager("jeune")
+    with pytest.raises(ErreurMetier, match="matrice"):
+        circulation.emprunter(carte, refs[0])
+
+
+def test_refus_double_pret_du_meme_exemplaire():
+    """Règle n°2 : un exemplaire ne peut pas être prêté deux fois."""
+    oeuvre_id, refs = creer_oeuvre("Roman unique", nb_copies=1)
+    carte_a = creer_usager(nom="Alice A")
+    carte_b = creer_usager(nom="Bruno B")
+    circulation.emprunter(carte_a, refs[0])
+    with pytest.raises(ErreurMetier, match="n'est pas disponible"):
+        circulation.emprunter(carte_b, refs[0])
+
+
+def test_refus_quota_atteint():
+    """Règle n°3 : quota par type (adulte : 2 DVD maximum)."""
+    oeuvre_id, refs = creer_oeuvre("DVD quota", type_document="dvd", nb_copies=3)
+    carte = creer_usager("adulte")
+    circulation.emprunter(carte, refs[0])
+    circulation.emprunter(carte, refs[1])
+    with pytest.raises(ErreurMetier, match="quota atteint"):
+        circulation.emprunter(carte, refs[2])
+
+
+def test_refus_compte_suspendu():
+    """Règle n°4 : aucun prêt sans compte actif."""
+    oeuvre_id, refs = creer_oeuvre("Roman suspendu", nb_copies=1)
+    carte = creer_usager("adulte", nom="Suspendu S")
+    from sigb.services import usagers_service
+
+    conn = db.get_conn()
+    usager_id = conn.execute("SELECT id FROM usager WHERE numero_carte = ?", (carte,)).fetchone()[0]
+    conn.close()
+    usagers_service.changer_statut_compte(usager_id, "suspendu")
+    with pytest.raises(ErreurMetier, match="suspendu"):
+        circulation.emprunter(carte, refs[0])
+
+
+def test_refus_adhesion_expiree():
+    """Règle n°4 : adhésion expirée = prêt refusé jusqu'au renouvellement."""
+    oeuvre_id, refs = creer_oeuvre("Roman expiré", nb_copies=1)
+    carte = creer_usager("adulte", nom="Expiré E")
+    conn = db.get_conn()
+    usager_id = conn.execute("SELECT id FROM usager WHERE numero_carte = ?", (carte,)).fetchone()[0]
+    conn.close()
+    with db.transaction() as txn:
+        txn.execute("UPDATE usager SET expiration_adhesion = '2000-01-01' WHERE id = ?", (usager_id,))
+    with pytest.raises(ErreurMetier, match="adhésion a expiré"):
+        circulation.emprunter(carte, refs[0])
+
+
+def test_refus_pendant_retard_en_cours():
+    """Règle n°4 : carte bloquée tant qu'un retard n'est pas régularisé."""
+    _, refs_retard = creer_oeuvre("Roman en retard", nb_copies=1)
+    carte = creer_usager("adulte", nom="Retardataire R")
+    _pret_en_retard(refs_retard[0], carte)
+    _, refs_autre = creer_oeuvre("Roman suivant", nb_copies=1)
+    with pytest.raises(ErreurMetier, match="bloquée"):
+        circulation.emprunter(carte, refs_autre[0])
+
+
+def test_retour_sans_probleme_remis_en_rayon():
+    oeuvre_id, refs = creer_oeuvre("Roman retour propre", nb_copies=1)
+    carte = creer_usager("adulte", nom="Clean C")
+    circulation.emprunter(carte, refs[0])
+    resultat = circulation.retourner(refs[0])
+    assert resultat["retard_jours"] == 0
+    assert "en rayon" in resultat["issue"]
+    conn = db.get_conn()
+    try:
+        assert exemplaires.par_reference(conn, refs[0])["statut"] == db.STATUT_DISPONIBLE
+    finally:
+        conn.close()
+
+
+def test_retard_sans_amende_bloque_puis_se_leve_apres_retour():
+    """Politique française (amendes désactivées) : blocage pendant le retard,
+    levé après retour — pas d'amende enregistrée."""
+    _, refs = creer_oeuvre("Roman retard fr", nb_copies=1)
+    carte = creer_usager("adulte", nom="Francais F")
+    _pret_en_retard(refs[0], carte, jours=3)
+    circulation.retourner(refs[0])
+    conn = db.get_conn()
+    try:
+        assert amendes.total_impayees(conn, None) >= 0  # accès DAO ok
+        assert conn.execute("SELECT COUNT(*) FROM amende").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # après retour, la carte n'est plus bloquée par le retard
+    _, refs2 = creer_oeuvre("Roman suivant fr", nb_copies=1)
+    circulation.emprunter(carte, refs2[0])  # ne doit pas lever d'ErreurMetier
+
+
+def test_amende_activee_calculee_par_jour():
+    """Option nord-américaine : amendes activées = montant = jours × tarif."""
+    _, refs = creer_oeuvre("Roman retard us", nb_copies=1)
+    carte = creer_usager("adulte", nom="Americain A")
+    _pret_en_retard(refs[0], carte, jours=4)
+    with db.transaction() as txn:
+        regles.definir_parametre(txn, regles.P_AMENDES_ACTIVEES, "1")
+    circulation.retourner(refs[0])
+    conn = db.get_conn()
+    try:
+        total = amendes.total_impayees(conn, conn.execute(
+            "SELECT id FROM usager WHERE numero_carte = ?", (carte,)).fetchone()[0])
+        assert total == round(4 * 0.25, 2)
+        # la carte reste bloquée jusqu'au règlement de l'amende
+        _, refs2 = creer_oeuvre("Roman suivant us", nb_copies=1)
+        with pytest.raises(ErreurMetier, match="amendes"):
+            circulation.emprunter(carte, refs2[0])
+    finally:
+        conn.close()
+
+
+def test_prolongation_une_seule_fois():
+    """Règle n°5 : une seule prolongation, la deuxième est refusée."""
+    _, refs = creer_oeuvre("Roman prolongable", nb_copies=1)
+    carte = creer_usager("adulte", nom="Prolonge P")
+    circulation.emprunter(carte, refs[0])
+    resultat = circulation.prolonger(refs[0])
+    assert resultat["nouvelle_echeance"] == db.aujourd_hui() + timedelta(days=42)
+    with pytest.raises(ErreurMetier, match="déjà été utilisée"):
+        circulation.prolonger(refs[0])
+
+
+def test_prolongation_refusee_si_retard():
+    _, refs = creer_oeuvre("Roman prolong retard", nb_copies=1)
+    carte = creer_usager("adulte", nom="Retard2 R")
+    _pret_en_retard(refs[0], carte, jours=2)
+    with pytest.raises(ErreurMetier, match="déjà en retard"):
+        circulation.prolonger(refs[0])
+
+
+def test_perte_declenche_amende_et_statut_perdu():
+    _, refs = creer_oeuvre("Roman perdu", nb_copies=1)
+    carte = creer_usager("adulte", nom="Perdant P")
+    circulation.emprunter(carte, refs[0])
+    resultat = circulation.declarer_perte(refs[0])
+    assert resultat["frais"] == 15.0
+    conn = db.get_conn()
+    try:
+        assert exemplaires.par_reference(conn, refs[0])["statut"] == db.STATUT_PERDU
+        assert conn.execute("SELECT COUNT(*) FROM amende WHERE motif = 'perte'").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notification WHERE type = 'amende'").fetchone()[0] == 1
+    finally:
+        conn.close()
+    # la carte est bloquée jusqu'au règlement
+    _, refs2 = creer_oeuvre("Roman apres perte", nb_copies=1)
+    with pytest.raises(ErreurMetier, match="amendes"):
+        circulation.emprunter(carte, refs2[0])
